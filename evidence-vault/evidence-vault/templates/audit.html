@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% import "_m.html" as m %}
+{% block title %}Audit log · Evidence Vault{% endblock %}
+{% block content %}
+<div class="card" style="margin-bottom:16px;display:flex;gap:18px;align-items:center;flex-wrap:wrap">
+  <div style="flex:1;min-width:260px">
+    <h2>Hash-chained audit log</h2>
+    <p class="muted small">Each entry stores the SHA-256 of the previous entry. Changing, deleting or re-ordering any row breaks every hash after it.</p>
+  </div>
+  <div class="alert {{ 'ok' if chain.valid else 'bad' }}" style="margin:0">
+    {% if chain.valid %}✔ Chain valid · {{ chain.entries }} entries<div class="mono small">head {{ chain.head[:24] }}…</div>
+    {% else %}✖ Chain BROKEN at entry #{{ chain.broken_at }} – {{ chain.reason }}{% endif %}
+  </div>
+  <div class="row-actions">
+    <button id="btn-verify-chain" class="btn primary">Re-verify chain</button>
+    <select id="audit-filter" style="width:auto"><option value="">All actions</option>
+      {% for a in actions %}<option value="{{ a }}">{{ a|label }}</option>{% endfor %}</select>
+  </div>
+</div>
+<div class="card"><div class="tbl-wrap" style="max-height:none"><table>
+  <thead><tr><th>#</th><th>Time</th><th>Investigator</th><th>Action</th><th>Evidence</th><th>Details</th><th>Entry hash ← previous</th></tr></thead>
+  <tbody id="audit-body">
+  {% for r in rows %}
+    <tr data-action="{{ r.action }}">
+      <td>{{ r.id }}</td><td>{{ m.t(r.ts) }}</td><td>{{ r.actor }}</td>
+      <td><b>{{ r.action|label }}</b>{% if 'FAIL' in r.action %} <span class="badge high">ALERT</span>{% endif %}</td>
+      <td>{% if r.evidence_id %}EV-{{ '%04d'|format(r.evidence_id) }}{% else %}—{% endif %}</td>
+      <td class="small muted">{{ r.detail|detail }}</td>
+      <td class="mono small">{{ r.entry_hash[:16] }}… ← {{ r.prev_hash[:8] }}…</td>
+    </tr>
+  {% endfor %}
+  </tbody></table></div></div>
+{% endblock %}

@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% import "_m.html" as m %}
+{% block title %}Fingerprint required · Evidence Vault{% endblock %}
+{% block content %}
+<section class="login-card" style="max-width:460px;margin:60px auto">
+  <h2>Fingerprint required</h2>
+  <p class="muted">Evidence can only be accessed after a fresh fingerprint scan by <b>{{ user }}</b>. The scan is recorded in the audit log.</p>
+  <button id="btn-unlock" class="fp-btn" data-next="{{ next }}">{{ m.fp_icon() }}<span>Scan fingerprint to continue</span></button>
+  <p id="login-status" class="status"></p>
+  <a href="{{ url_for('dashboard') }}" class="small">← Back to dashboard</a>
+</section>
+{% endblock %}

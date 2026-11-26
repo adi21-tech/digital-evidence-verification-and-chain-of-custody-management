@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% import "_m.html" as m %}
+{% block title %}Dashboard · Evidence Vault{% endblock %}
+{% block content %}
+<div class="stats">
+  <div class="stat"><div class="n">{{ stats.total }}</div><div class="l">Evidence items</div></div>
+  <div class="stat good"><div class="n">{{ stats.intact }}</div><div class="l">Integrity intact</div></div>
+  <div class="stat {{ 'bad' if stats.tampered }}"><div class="n">{{ stats.tampered }}</div><div class="l">Tampered</div></div>
+  <div class="stat {{ 'warn' if stats.risky }}"><div class="n">{{ stats.risky }}</div><div class="l">High / critical risk</div></div>
+  <div class="stat {{ 'good' if chain.valid else 'bad' }}"><div class="n">{{ '✔' if chain.valid else '✖' }}</div>
+    <div class="l">Audit chain · {{ chain.entries }} entries</div></div>
+</div>
+
+{% if stats.tampered %}<div class="alert bad"><b>Tampering detected:</b> {{ stats.tampered }} item(s) no longer match their recorded SHA-256. Open them for details.</div>{% endif %}
+{% if not chain.valid %}<div class="alert bad"><b>Audit log chain is broken</b> at entry #{{ chain.broken_at }} ({{ chain.reason }}).</div>{% endif %}
+
+<div class="grid cols">
+  <section class="card">
+    <h3>Evidence register
+      <span class="row-actions">
+        {% if cases|length > 1 %}
+        <select id="case-filter" style="width:auto">
+          <option value="">All cases</option>{% for c in cases %}<option {{ 'selected' if c == case }}>{{ c }}</option>{% endfor %}
+        </select>{% endif %}
+        <button id="btn-verify-all" class="btn sm">Verify all integrity</button>
+        <a class="btn sm primary" href="{{ url_for('report', case=case) }}">Export custody report</a>
+      </span>
+    </h3>
+    <p class="small muted">Sorted by risk. Opening an item asks for a fingerprint scan{% if fresh %} (your scan is still valid for a few minutes){% endif %}.</p>
+    <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>ID</th><th>File &amp; why it is flagged</th><th>SHA-256</th><th>Custodian</th><th>Integrity</th><th>Risk</th></tr></thead>
+      <tbody>
+      {% for e in items %}
+        <tr class="link">
+          <td><a href="{{ url_for('evidence_detail', eid=e.id) }}">EV-{{ '%04d'|format(e.id) }}</a></td>
+          <td><a href="{{ url_for('evidence_detail', eid=e.id) }}">{{ e.rel_path }}</a>
+            <div class="small muted">{{ e.case_id }} · {{ e.size_bytes|filesize }}</div>
+            {% for f in e.risk.findings if f.points > 0 %}{% if loop.index <= 3 %}<span class="chip {{ f.severity }}">{{ f.title }}</span>{% endif %}{% endfor %}
+          </td>
+          <td class="mono" title="{{ e.sha256 }}">{{ e.sha256[:14] }}…</td>
+          <td>{{ e.custodian }}</td>
+          <td>{{ m.status(e.status) }}</td>
+          <td>{{ m.badge(e.risk.level, e.risk.score) }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="6" class="muted" style="padding:30px;text-align:center">No evidence yet – choose an evidence folder on the right.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+  </section>
+
+  <div class="grid">
+    <section class="card" id="upload-card">
+      <h3>Ingest evidence</h3>
+      <label for="case_id">Case ID</label>
+      <input id="case_id" value="{{ case or (cases[0] if cases else 'CASE-001') }}" maxlength="60">
+      <div class="row-actions" style="margin-top:12px">
+        <button id="pick-folder" class="btn">📁 Choose evidence folder</button>
+        <button id="pick-files" class="btn ghost">Choose files</button>
+      </div>
+      <input type="file" id="in-folder" webkitdirectory multiple hidden>
+      <input type="file" id="in-files" multiple hidden>
+      <div id="staged" class="staged"></div>
+      <button id="btn-ingest" class="btn primary" disabled>Hash &amp; ingest (SHA-256)</button>
+      <div id="progress" class="progress" hidden><div></div></div>
+      <p class="small muted">Each file is hashed, its metadata captured (size, type, last-modified, EXIF) and screened for tampering.</p>
+    </section>
+
+    <section class="card">
+      <h3>Unusual access patterns <span class="badge {{ 'high' if anomalies else 'ok' }}">{{ anomalies|length }}</span></h3>
+      <ul class="list">
+      {% for a in anomalies %}
+        <li><span class="badge {{ a.severity }}">{{ a.severity|upper }}</span> <b>{{ a.title }}</b><div class="small muted">{{ a.detail }}</div></li>
+      {% else %}<li class="muted small">No unusual access detected.</li>{% endfor %}
+      </ul>
+    </section>
+
+    <section class="card">
+      <h3>Recent activity <a class="small" href="{{ url_for('audit_page') }}">full audit log →</a></h3>
+      <ul class="list small">
+      {% for r in recent %}
+        <li><b>{{ r.action|label }}</b> · {{ r.actor }}{% if r.evidence_id %} · EV-{{ '%04d'|format(r.evidence_id) }}{% endif %}
+          <div class="muted">{{ m.t(r.ts) }}</div></li>
+      {% endfor %}
+      </ul>
+    </section>
+
+    <section class="card">
+      <h3>Investigators
+        {% if role == 'admin' %}<button id="btn-enroll" class="btn sm">+ Enroll investigator</button>{% endif %}</h3>
+      <ul class="list small">
+      {% for u in users %}<li>{{ u.username }} <span class="muted">· {{ u.role }}</span></li>{% endfor %}
+      </ul>
+    </section>
+  </div>
+</div>
+{% endblock %}

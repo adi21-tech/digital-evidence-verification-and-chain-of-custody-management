@@ -1,0 +1,426 @@
+"""Evidence Vault - Digital Evidence Verification & Chain-of-Custody (AVISHKAR'26, team IGRIS).
+Run:  python app.py      then open  http://localhost:5000
+
+"""
+import datetime as dt
+import json
+import os
+import secrets
+import time
+from functools import wraps
+
+from flask import (Flask, Response, abort, jsonify, redirect, render_template, request,
+                   send_file, session, url_for)
+
+import core
+import webauthn_lite as wa
+
+core.init_db()
+
+app = Flask(__name__)
+app.config.update(
+    SECRET_KEY=core.secret_key(),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=dt.timedelta(minutes=30),   # idle timeout
+    MAX_CONTENT_LENGTH=512 * 1024 * 1024,
+    MAX_FORM_PARTS=100000,
+)
+FRESH_SECONDS = 600            # a fingerprint scan unlocks evidence access for 10 minutes
+DEMO_MODE = os.environ.get("DEMO_MODE", "1") == "1"
+
+
+# ------------------------------------------------------------------ helpers
+def is_logged_in():
+    return "uid" in session
+
+
+def wants_json():
+    return request.path.startswith("/api/") or request.method != "GET"
+
+
+def safe_next(n):
+    return n if n and n.startswith("/") and not n.startswith("//") else "/dashboard"
+
+
+def login_required(f):
+    @wraps(f)
+    def w(*a, **k):
+        if not is_logged_in():
+            if wants_json():
+                return jsonify(error="login_required"), 401
+            return redirect(url_for("login", next=request.full_path.rstrip("?")))
+        return f(*a, **k)
+    return w
+
+
+def fresh_required(f):
+    """Evidence access needs a recent fingerprint scan, not just an open session."""
+    @wraps(f)
+    def w(*a, **k):
+        if time.time() > session.get("fresh_until", 0):
+            if wants_json():
+                return jsonify(error="fingerprint_required"), 403
+            return render_template("unlock.html", next=safe_next(request.full_path.rstrip("?")))
+        return f(*a, **k)
+    return login_required(w)
+
+
+def start_session(uid, username, role):
+    session.clear()
+    session.permanent = True
+    session.update(uid=uid, username=username, role=role, fresh_until=time.time() + FRESH_SECONDS)
+
+
+def rp_info():
+    return request.host.split(":")[0], request.host_url.rstrip("/")
+
+
+def fmt_detail(d, limit=46):
+    if not d:
+        return ""
+    parts = []
+    for k, v in d.items():
+        s = str(v)
+        parts.append(f"{k}: {s[:limit] + '…' if len(s) > limit else s}")
+    return "  ·  ".join(parts)
+
+
+app.jinja_env.filters["detail"] = fmt_detail
+app.jinja_env.filters["short"] = lambda v, n=12: (str(v)[:n] + "…") if v and len(str(v)) > n else (v or "")
+app.jinja_env.filters["label"] = lambda a: core.ACTION_LABELS.get(a, a)
+app.jinja_env.filters["filesize"] = lambda n: (f"{n} B" if n < 1024 else f"{n/1024:.1f} KB" if n < 1048576 else f"{n/1048576:.1f} MB")
+
+
+@app.context_processor
+def inject():
+    return {"user": session.get("username"), "role": session.get("role"), "demo_mode": DEMO_MODE,
+            "key_fp": core.key_fingerprint() if is_logged_in() else None}
+
+
+@app.after_request
+def headers(resp):
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self'; frame-ancestors 'none'; form-action 'self'")
+    return resp
+
+
+# ------------------------------------------------------------------ pages: login
+@app.get("/")
+def index():
+    return redirect(url_for("dashboard" if is_logged_in() else "login"))
+
+
+@app.get("/login")
+def login():
+    if is_logged_in():
+        return redirect(url_for("dashboard"))
+    return render_template("login.html", has_users=core.user_count() > 0, next=safe_next(request.args.get("next")))
+
+
+@app.get("/logout")
+def logout():
+    if is_logged_in():
+        core.audit(session["username"], "LOGOUT", None, {})
+    session.clear()
+    return redirect(url_for("login"))
+
+
+# ------------------------------------------------------------------ WebAuthn (fingerprint) API
+@app.post("/api/webauthn/register/options")
+def reg_options():
+    name = ((request.get_json(silent=True) or {}).get("name") or "").strip()[:60]
+    first = core.user_count() == 0
+    if not first and not (is_logged_in() and session.get("role") == "admin"):
+        return jsonify(error="Only the lead investigator can enroll new investigators."), 403
+    if not name:
+        return jsonify(error="Enter a name first."), 400
+    if core.get_user(name):
+        return jsonify(error="That investigator name already exists."), 409
+    rp_id, _ = rp_info()
+    challenge, handle = wa.b64u_enc(secrets.token_bytes(32)), wa.b64u_enc(secrets.token_bytes(16))
+    session["reg"] = {"challenge": challenge, "name": name, "handle": handle}
+    return jsonify(
+        challenge=challenge, rp={"name": "Evidence Vault", "id": rp_id},
+        user={"id": handle, "name": name, "displayName": name},
+        pubKeyCredParams=[{"type": "public-key", "alg": -7}, {"type": "public-key", "alg": -257}],
+        authenticatorSelection={"authenticatorAttachment": "platform", "userVerification": "required",
+                                "residentKey": "preferred"},
+        timeout=60000, attestation="none")
+
+
+@app.post("/api/webauthn/register/verify")
+def reg_verify():
+    pend = session.pop("reg", None)
+    if not pend:
+        return jsonify(error="Enrollment expired, try again."), 400
+    first = core.user_count() == 0
+    if not first and not (is_logged_in() and session.get("role") == "admin"):
+        return jsonify(error="Not allowed."), 403
+    rp_id, origin = rp_info()
+    try:
+        info = wa.verify_registration(request.get_json(silent=True) or {}, pend["challenge"], rp_id, origin)
+        uid = core.create_user(pend["name"], pend["handle"], "admin" if first else "investigator")
+        core.add_credential(uid, info["cred_id"], info["cose_raw"], info["sign_count"])
+    except Exception as e:
+        core.audit(pend["name"], "ENROLL_FAILED", None, {"reason": str(e)[:120]})
+        return jsonify(error=f"Enrollment rejected: {e}"), 400
+    core.audit(pend["name"], "ENROLL_FINGERPRINT", None,
+               {"credential": info["cred_id"][:16], "enrolled_by": session.get("username") or pend["name"],
+                "role": "admin" if first else "investigator"})
+    if first:
+        start_session(uid, pend["name"], "admin")
+    return jsonify(ok=True, first=first)
+
+
+@app.post("/api/webauthn/login/options")
+def login_options():
+    purpose = "stepup" if (request.get_json(silent=True) or {}).get("purpose") == "stepup" and is_logged_in() else "login"
+    creds = core.all_credentials()
+    if purpose == "stepup":
+        creds = [c for c in creds if c["user_id"] == session["uid"]]
+    if not creds:
+        return jsonify(error="No investigator has enrolled a fingerprint yet."), 400
+    challenge = wa.b64u_enc(secrets.token_bytes(32))
+    session["auth"] = {"challenge": challenge, "purpose": purpose}
+    rp_id, _ = rp_info()
+    return jsonify(challenge=challenge, rpId=rp_id, timeout=60000, userVerification="required",
+                   allowCredentials=[{"type": "public-key", "id": c["cred_id"], "transports": ["internal"]} for c in creds])
+
+
+def _log_failure(actor, reason):
+    if core.recent_count("LOGIN_FAILED", 10) < 50:      # keep unauthenticated callers from flooding the log
+        core.audit(actor, "LOGIN_FAILED", None, {"reason": reason[:140], "ip": request.remote_addr})
+
+
+@app.post("/api/webauthn/login/verify")
+def login_verify():
+    pend, body = session.pop("auth", None), request.get_json(silent=True) or {}
+    if not pend:
+        return jsonify(error="Fingerprint request expired, try again."), 400
+    cred = core.get_credential(body.get("id", ""))
+    if not cred:
+        _log_failure("unknown", "unknown credential")
+        return jsonify(error="Unknown fingerprint credential."), 401
+    if pend["purpose"] == "stepup" and cred["user_id"] != session.get("uid"):
+        _log_failure(cred["username"], "step-up attempted with a different investigator's credential")
+        return jsonify(error="That fingerprint belongs to a different investigator."), 403
+    rp_id, origin = rp_info()
+    try:
+        new_count = wa.verify_assertion(body, pend["challenge"], rp_id, origin, cred["cose_key"], cred["sign_count"])
+    except Exception as e:
+        _log_failure(cred["username"], str(e))
+        return jsonify(error=f"Fingerprint rejected: {e}"), 401
+    core.update_sign_count(cred["id"], new_count)
+    detail = {"credential": cred["cred_id"][:16], "ip": request.remote_addr,
+              "browser": (request.user_agent.string or "")[:90]}
+    if pend["purpose"] == "stepup":
+        session["fresh_until"] = time.time() + FRESH_SECONDS
+        core.audit(cred["username"], "STEPUP_FINGERPRINT_SUCCESS", None, detail)
+    else:
+        start_session(cred["user_id"], cred["username"], cred["role"])
+        core.audit(cred["username"], "LOGIN_FINGERPRINT_SUCCESS", None, detail)
+    return jsonify(ok=True, user=cred["username"])
+
+
+@app.post("/api/webauthn/login/fail")
+def login_fail():
+    reason = (request.get_json(silent=True) or {}).get("reason", "cancelled")
+    _log_failure(session.get("username") or "unknown", f"fingerprint not accepted on device ({str(reason)[:40]})")
+    return jsonify(ok=True)
+
+
+# ------------------------------------------------------------------ dashboard
+@app.get("/dashboard")
+@login_required
+def dashboard():
+    case = request.args.get("case") or None
+    ev, rows, dup_map, by_ev = core.context()
+    items = [core.attach_risk(e, dup_map, by_ev) for e in ev]
+    cases = sorted({e["case_id"] for e in items})
+    if case:
+        items = [e for e in items if e["case_id"] == case]
+    items.sort(key=lambda e: (-e["risk"]["score"], e["id"]))
+    stats = {"total": len(items),
+             "intact": sum(1 for e in items if e["status"] == "INTACT"),
+             "tampered": sum(1 for e in items if e["status"] == "TAMPERED"),
+             "risky": sum(1 for e in items if e["risk"]["level"] in ("HIGH", "CRITICAL")),
+             "dups": sum(1 for e in items if any(f["category"] == "duplicate" for f in e["risk"]["findings"]))}
+    return render_template("dashboard.html", items=items, cases=cases, case=case, stats=stats,
+                           chain=core.verify_chain(), anomalies=core.access_anomalies(rows),
+                           recent=list(reversed(rows[-8:])), users=core.list_users(),
+                           fresh=time.time() < session.get("fresh_until", 0))
+
+
+@app.post("/upload")
+@login_required
+def upload():
+    case_id = (request.form.get("case_id") or "CASE-001").strip()[:60]
+    try:
+        meta = json.loads(request.form.get("meta", "[]"))
+    except ValueError:
+        meta = []
+    out = []
+    for i, f in enumerate(request.files.getlist("files")):
+        m = meta[i] if i < len(meta) and isinstance(meta[i], dict) else {}
+        out.append(core.ingest(case_id, m.get("path") or f.filename, f.read(), m.get("mtime"),
+                               session["username"], f.mimetype))
+    return jsonify(ok=True, items=out)
+
+
+@app.post("/verify-all")
+@login_required
+def verify_all():
+    ev, *_ = core.context()
+    bad = []
+    for e in ev:
+        if not core.verify_integrity(e["id"], session["username"], log=False)["ok"]:
+            bad.append(f"EV-{e['id']:04d}")
+    core.audit(session["username"], "VERIFY_ALL", None, {"checked": len(ev), "tampered": bad})
+    return jsonify(ok=True, checked=len(ev), tampered=bad)
+
+
+# ------------------------------------------------------------------ evidence
+@app.get("/evidence/<int:eid>")
+@fresh_required
+def evidence_detail(eid):
+    if not core.get_evidence(eid):
+        abort(404)
+    core.audit(session["username"], "VIEW_EVIDENCE", eid, {"ip": request.remote_addr})
+    ev, rows, dup_map, by_ev = core.context()
+    e = core.attach_risk(next(x for x in ev if x["id"] == eid), dup_map, by_ev)
+    others = [u for u in core.list_users() if u["username"] != session["username"]]
+    return render_template("evidence.html", e=e, events=by_ev.get(eid, []), others=others,
+                           dups=[i for i in dup_map[e["sha256"]] if i != eid])
+
+
+@app.get("/evidence/<int:eid>/download")
+@fresh_required
+def download(eid):
+    row = core.get_evidence(eid) or abort(404)
+    p = core.blob_path(eid)
+    current = core.sha256_file(p) if p.exists() else None
+    ok = current == row["sha256"]
+    if not ok:
+        core.mark_tampered(eid, current)
+    core.audit(session["username"], "DOWNLOAD_EVIDENCE", eid, {"served_sha256": current, "matches_record": ok})
+    if not p.exists():
+        abort(404)
+    return send_file(p, as_attachment=True, download_name=row["filename"])
+
+
+@app.post("/evidence/<int:eid>/verify")
+@fresh_required
+def verify(eid):
+    if not core.get_evidence(eid):
+        abort(404)
+    return jsonify(core.verify_integrity(eid, session["username"]))
+
+
+@app.post("/evidence/<int:eid>/verify-copy")
+@fresh_required
+def verify_copy(eid):
+    row = core.get_evidence(eid) or abort(404)
+    f = request.files.get("file")
+    if not f:
+        return jsonify(error="Choose a file."), 400
+    sha = core.sha256_hex(f.read())
+    match = sha == row["sha256"]
+    core.audit(session["username"], "VERIFY_EXTERNAL_COPY", eid,
+               {"result": "MATCH" if match else "MISMATCH", "copy_sha256": sha, "recorded_sha256": row["sha256"]})
+    return jsonify(ok=match, expected=row["sha256"], computed=sha)
+
+
+# ------------------------------------------------------------------ NEW: verify documents page
+@app.get("/verify-documents")
+@fresh_required
+def verify_docs_page():
+    return render_template("verify.html")
+
+
+@app.post("/verify-documents/check")
+@fresh_required
+def verify_docs_check():
+    f = request.files.get("file")
+    if not f:
+        return jsonify(error="Choose a file."), 400
+    return jsonify(core.verify_document(f.filename, f.read(), session["username"]))
+# ------------------------------------------------------------------ end NEW
+
+
+@app.post("/evidence/<int:eid>/transfer")
+@fresh_required
+def transfer(eid):
+    row = core.get_evidence(eid) or abort(404)
+    body = request.get_json(silent=True) or {}
+    to = core.get_user((body.get("to") or "").strip())
+    if not to or to["username"] == session["username"]:
+        return jsonify(error="Choose another enrolled investigator."), 400
+    core.transfer(eid, session["username"], to["username"], (body.get("reason") or "").strip() or "no reason given")
+    return jsonify(ok=True, custodian=to["username"])
+
+
+@app.post("/evidence/<int:eid>/demo-tamper")
+@fresh_required
+def demo_tamper(eid):
+    """DEMO ONLY: alters the stored copy of a synthetic sample file so the detector can be shown."""
+    if not DEMO_MODE:
+        abort(404)
+    if not core.get_evidence(eid):
+        abort(404)
+    with open(core.blob_path(eid), "ab") as f:
+        f.write(b"\n")
+    core.audit(session["username"], "DEMO_TAMPER_SIMULATION", eid, {"note": "synthetic sample altered for demonstration"})
+    return jsonify(ok=True)
+
+
+# ------------------------------------------------------------------ audit log, report, API
+@app.get("/audit")
+@login_required
+def audit_page():
+    rows = core.load_audit()
+    return render_template("audit.html", rows=list(reversed(rows)), chain=core.verify_chain(),
+                           actions=sorted({r["action"] for r in rows}))
+
+
+@app.post("/api/audit/verify")
+@login_required
+def audit_verify():
+    res = core.verify_chain()
+    core.audit(session["username"], "VERIFY_AUDIT_CHAIN", None, {"valid": res["valid"], "entries": res["entries"]})
+    return jsonify(res)
+
+
+@app.get("/report")
+@fresh_required
+def report():
+    case = request.args.get("case") or None
+    core.audit(session["username"], "EXPORT_REPORT", None, {"case": case or "ALL"})
+    rep = core.build_report(case, session["username"])
+    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = f"custody_report_{(case or 'ALL').replace(' ', '_')}_{stamp}.json"
+    return Response(json.dumps(rep, indent=2, ensure_ascii=False), mimetype="application/json",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+@app.get("/api/evidence")
+@login_required
+def api_evidence():
+    ev, _, dup_map, by_ev = core.context()
+    out = []
+    for e in ev:
+        e = core.attach_risk(e, dup_map, by_ev)
+        out.append({"id": f"EV-{e['id']:04d}", "case": e["case_id"], "path": e["rel_path"], "sha256": e["sha256"],
+                    "size": e["size_bytes"], "custodian": e["custodian"], "integrity": e["status"],
+                    "risk_score": e["risk"]["score"], "risk_level": e["risk"]["level"],
+                    "reasons": [f["title"] for f in e["risk"]["findings"] if f["points"] > 0]})
+    return jsonify(out)
+
+
+if __name__ == "__main__":
+    print("\n  Evidence Vault running  ->  http://localhost:5000   (use 'localhost', not 127.0.0.1)\n")
+    app.run(host="127.0.0.1", port=5000, debug=False)

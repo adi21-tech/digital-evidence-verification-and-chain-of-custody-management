@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Verify documents · Evidence Vault{% endblock %}
+{% block content %}
+<section class="vd-card">
+  <h2>Verify document</h2>
+  <p class="muted">Upload a document. We hash it and compare it with the hash recorded when it was ingested.</p>
+  <form id="vd-form">
+    <input type="file" id="vd-file">
+    <button type="submit" class="vd-btn">Verify</button>
+  </form>
+  <div id="vd-result"></div>
+</section>
+<script src="{{ url_for('static', filename='verify.js') }}" defer></script>
+{% endblock %}

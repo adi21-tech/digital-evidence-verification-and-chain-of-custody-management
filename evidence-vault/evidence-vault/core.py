@@ -1,0 +1,627 @@
+"""Evidence Vault core: SQLite storage, hash-chained audit log, evidence ingest,
+explainable risk analysis and Ed25519-signed custody reports."""
+import base64
+import datetime as dt
+import hashlib
+import io
+import json
+import os
+import re
+import secrets
+import sqlite3
+from collections import Counter
+from contextlib import contextmanager
+from pathlib import Path
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
+
+BASE = Path(__file__).resolve().parent
+DATA = Path(os.environ.get("VAULT_DATA_DIR", BASE / "data"))
+STORE = DATA / "store"
+DB_PATH = DATA / "vault.db"
+KEY_PATH = DATA / "signing_key.pem"
+SECRET_PATH = DATA / "secret.key"
+GENESIS = "0" * 64
+OFFICE_START, OFFICE_END = 6, 22          # access outside 06:00-22:00 (local) is "after hours"
+ACCESS_ACTIONS = ("VIEW_EVIDENCE", "DOWNLOAD_EVIDENCE")
+
+ACTION_LABELS = {
+    "ENROLL_FINGERPRINT": "Fingerprint enrolled",
+    "LOGIN_FINGERPRINT_SUCCESS": "Fingerprint login",
+    "STEPUP_FINGERPRINT_SUCCESS": "Fingerprint re-verified",
+    "LOGIN_FAILED": "Fingerprint failed",
+    "ENROLL_FAILED": "Enrollment failed",
+    "LOGOUT": "Logout",
+    "UPLOAD": "Evidence ingested",
+    "VIEW_EVIDENCE": "Evidence opened",
+    "DOWNLOAD_EVIDENCE": "Evidence downloaded",
+    "VERIFY_INTEGRITY": "Integrity verified",
+    "VERIFY_ALL": "Bulk integrity check",
+    "VERIFY_EXTERNAL_COPY": "External copy compared",
+    "TRANSFER": "Custody transferred",
+    "EXPORT_REPORT": "Report exported",
+    "VERIFY_AUDIT_CHAIN": "Audit chain verified",
+    "DEMO_TAMPER_SIMULATION": "Tamper simulated (demo)",
+}
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, user_handle TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'investigator', created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS credentials(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id),
+  cred_id TEXT UNIQUE NOT NULL, cose_key BLOB NOT NULL, sign_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS evidence(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, case_id TEXT NOT NULL, rel_path TEXT NOT NULL,
+  filename TEXT NOT NULL, size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, meta TEXT NOT NULL,
+  static_findings TEXT NOT NULL, uploaded_by TEXT NOT NULL, uploaded_at TEXT NOT NULL,
+  custodian TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'INTACT', last_verified_at TEXT, last_hash TEXT);
+CREATE TABLE IF NOT EXISTS audit_log(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
+  evidence_id INTEGER, detail TEXT NOT NULL, prev_hash TEXT NOT NULL, entry_hash TEXT NOT NULL);
+"""
+
+
+# ------------------------------------------------------------------ basics
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def parse_ts(s: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def canon(obj) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def sha256_hex(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+@contextmanager
+def db():
+    DATA.mkdir(parents=True, exist_ok=True)
+    STORE.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
+    c.row_factory = sqlite3.Row
+    try:
+        yield c
+    finally:
+        c.close()
+
+
+def init_db():
+    with db() as c:
+        c.executescript(SCHEMA)
+
+
+def secret_key() -> str:
+    DATA.mkdir(parents=True, exist_ok=True)
+    if not SECRET_PATH.exists():
+        SECRET_PATH.write_text(secrets.token_hex(32))
+    return SECRET_PATH.read_text().strip()
+
+
+def blob_path(eid: int) -> Path:
+    return STORE / f"{eid}.bin"
+
+
+# ------------------------------------------------------------------ users / credentials
+def user_count() -> int:
+    with db() as c:
+        return c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+
+def list_users():
+    with db() as c:
+        return [dict(r) for r in c.execute("SELECT id, username, role, created_at FROM users ORDER BY id")]
+
+
+def get_user(name: str):
+    with db() as c:
+        r = c.execute("SELECT * FROM users WHERE username=?", (name,)).fetchone()
+        return dict(r) if r else None
+
+
+def create_user(name: str, handle: str, role: str) -> int:
+    with db() as c:
+        return c.execute("INSERT INTO users(username,user_handle,role,created_at) VALUES(?,?,?,?)",
+                         (name, handle, role, now_iso())).lastrowid
+
+
+def add_credential(uid: int, cred_id: str, cose_raw: bytes, sign_count: int):
+    with db() as c:
+        c.execute("INSERT INTO credentials(user_id,cred_id,cose_key,sign_count,created_at) VALUES(?,?,?,?,?)",
+                  (uid, cred_id, cose_raw, sign_count, now_iso()))
+
+
+def all_credentials():
+    with db() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT c.*, u.username, u.role FROM credentials c JOIN users u ON u.id=c.user_id ORDER BY c.id")]
+
+
+def get_credential(cred_id: str):
+    with db() as c:
+        r = c.execute("SELECT c.*, u.username, u.role FROM credentials c JOIN users u ON u.id=c.user_id "
+                      "WHERE c.cred_id=?", (cred_id,)).fetchone()
+        return dict(r) if r else None
+
+
+def update_sign_count(cid: int, n: int):
+    with db() as c:
+        c.execute("UPDATE credentials SET sign_count=? WHERE id=?", (n, cid))
+
+
+# ------------------------------------------------------------------ hash-chained audit log
+def entry_hash(prev, ts, actor, action, evidence_id, detail_json) -> str:
+    return sha256_hex(canon({"prev": prev, "ts": ts, "actor": actor, "action": action,
+                             "evidence": evidence_id, "detail": detail_json}).encode())
+
+
+def audit(actor: str, action: str, evidence_id=None, detail=None) -> str:
+    """Append an entry whose hash covers the previous entry's hash (blockchain-style chain)."""
+    detail_json = canon(detail or {})
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            last = c.execute("SELECT entry_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+            prev = last["entry_hash"] if last else GENESIS
+            ts = now_iso()
+            h = entry_hash(prev, ts, actor, action, evidence_id, detail_json)
+            c.execute("INSERT INTO audit_log(ts,actor,action,evidence_id,detail,prev_hash,entry_hash) "
+                      "VALUES(?,?,?,?,?,?,?)", (ts, actor, action, evidence_id, detail_json, prev, h))
+            c.execute("COMMIT")
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
+    return h
+
+
+def load_audit(c=None):
+    def _load(conn):
+        rows = []
+        for r in conn.execute("SELECT * FROM audit_log ORDER BY id"):
+            d = dict(r)
+            d["detail_raw"] = d["detail"]
+            d["detail"] = json.loads(d["detail"])
+            rows.append(d)
+        return rows
+    if c is not None:
+        return _load(c)
+    with db() as conn:
+        return _load(conn)
+
+
+def verify_chain() -> dict:
+    prev, n = GENESIS, 0
+    with db() as c:
+        for r in c.execute("SELECT * FROM audit_log ORDER BY id"):
+            n += 1
+            if r["prev_hash"] != prev:
+                return {"valid": False, "entries": n, "broken_at": r["id"], "reason": "previous-hash link broken"}
+            exp = entry_hash(prev, r["ts"], r["actor"], r["action"], r["evidence_id"], r["detail"])
+            if exp != r["entry_hash"]:
+                return {"valid": False, "entries": n, "broken_at": r["id"], "reason": "entry content was modified"}
+            prev = r["entry_hash"]
+    return {"valid": True, "entries": n, "head": prev}
+
+
+def recent_count(action: str, minutes: int) -> int:
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    with db() as c:
+        return c.execute("SELECT COUNT(*) FROM audit_log WHERE action=? AND ts>=?", (action, cutoff)).fetchone()[0]
+
+
+# ------------------------------------------------------------------ file analysis helpers
+MAGIC = [(b"\x89PNG\r\n\x1a\n", "png"), (b"\xff\xd8\xff", "jpeg"), (b"GIF8", "gif"), (b"%PDF", "pdf"),
+         (b"PK\x03\x04", "zip"), (b"\x7fELF", "elf"), (b"Rar!", "rar"), (b"7z\xbc\xaf", "7z"),
+         (b"SQLite format 3", "sqlite"), (b"\x1f\x8b", "gzip")]
+EXT_TYPE = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "gif": "gif", "pdf": "pdf", "zip": "zip",
+            "docx": "zip", "xlsx": "zip", "pptx": "zip", "exe": "exe", "dll": "exe", "bmp": "bmp",
+            "gz": "gzip", "db": "sqlite", "sqlite": "sqlite", "rar": "rar", "7z": "7z"}
+TEXT_EXT = {"txt", "log", "csv", "json", "xml", "html", "md", "eml", "tsv"}
+EDITORS = re.compile(r"photoshop|gimp|lightroom|paint|canva|snapseed|pixlr|affinity|picsart|illustrator|fotor", re.I)
+FILENAME_DATE = re.compile(r"(?<!\d)(20\d{2})[-_]?(0[1-9]|1[0-2])[-_]?(0[1-9]|[12]\d|3[01])(?!\d)")
+
+
+def detect_type(data: bytes) -> str:
+    head = data[:4096]
+    for sig, name in MAGIC:
+        if head.startswith(sig):
+            return name
+    if head[:2] == b"MZ" and b"\x00" in head[:64]:
+        return "exe"
+    if head[:2] == b"BM" and head[6:10] == b"\x00\x00\x00\x00":
+        return "bmp"
+    if len(head) > 12 and head[4:8] == b"ftyp":
+        return "mp4"
+    try:
+        txt = head.decode("utf-8")
+        bad = sum(1 for ch in txt if ord(ch) < 9 or 13 < ord(ch) < 32)
+        return "text" if bad <= max(2, len(txt) // 200) else "binary"
+    except UnicodeDecodeError:
+        return "binary"
+
+
+def shannon_entropy(b: bytes) -> float:
+    if not b:
+        return 0.0
+    n = len(b)
+    return round(-sum((c / n) * __import__("math").log2(c / n) for c in Counter(b).values()), 4)
+
+
+def read_exif(data: bytes):
+    try:
+        from PIL import Image
+        im = Image.open(io.BytesIO(data))
+        info = {"format": im.format, "width": im.width, "height": im.height}
+        out = {}
+        ex = im.getexif()
+        for tag, name in ((271, "Make"), (272, "Model"), (305, "Software"), (306, "DateTime")):
+            if tag in ex:
+                out[name] = str(ex[tag]).strip()
+        try:
+            sub = ex.get_ifd(0x8769)
+            for tag, name in ((36867, "DateTimeOriginal"), (36868, "DateTimeDigitized")):
+                if tag in sub:
+                    out[name] = str(sub[tag]).strip()
+        except Exception:
+            pass
+        try:
+            if ex.get_ifd(0x8825):
+                out["GPS"] = "present"
+        except Exception:
+            pass
+        return info, out
+    except Exception:
+        return {}, {}
+
+
+def parse_exif_dt(s):
+    try:
+        return dt.datetime.strptime(str(s)[:19], "%Y:%m:%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def clean_rel(p: str) -> str:
+    parts = [s for s in (p or "").replace("\\", "/").split("/") if s not in ("", ".", "..")]
+    return "/".join(parts)[:300] or "unnamed"
+
+
+def level(score: int) -> str:
+    return "CRITICAL" if score >= 70 else "HIGH" if score >= 40 else "MEDIUM" if score >= 15 else "LOW"
+
+
+CATEGORIES = [("integrity", "SHA-256 integrity"), ("duplicate", "Duplicate detection"),
+              ("type", "File type vs extension"), ("timeline", "Timeline consistency"),
+              ("metadata", "Metadata authenticity"), ("entropy", "Content entropy"),
+              ("access", "Access pattern")]
+
+
+def static_findings(meta: dict, now: dt.datetime) -> list:
+    """Checks that only need the file itself (run once at ingest)."""
+    F = []
+
+    def add(cat, sev, pts, title, detail):
+        F.append({"category": cat, "severity": sev, "points": pts, "title": title, "detail": detail})
+
+    ext, det, name = meta["extension"], meta["detected_type"], meta["filename"]
+    expected = EXT_TYPE.get(ext)
+
+    # --- file type vs extension
+    if det in ("exe", "elf") and ext not in ("exe", "dll", "so", "bin", "elf"):
+        add("type", "critical", 40, f"Executable disguised as .{ext or 'file'}",
+            f"Content starts with a {det.upper()} header but the name says '.{ext}'.")
+    elif expected and det != expected:
+        add("type", "high", 30, f"Extension '.{ext}' does not match content",
+            f"Name claims {expected}, but the content signature looks like '{det}'.")
+    elif ext in TEXT_EXT and det not in ("text", "binary"):
+        add("type", "high", 30, f"Text-named file is really '{det}'",
+            f"'.{ext}' files should be plain text, but the signature is '{det}'.")
+
+    # --- entropy
+    if ext in TEXT_EXT and meta["entropy"] > 7.0:
+        add("entropy", "high", 25, "Text file looks encrypted or packed",
+            f"Shannon entropy {meta['entropy']}/8 is far above normal text (≈4–5).")
+
+    # --- timeline
+    mt = None
+    if meta.get("last_modified"):
+        try:
+            mt = dt.datetime.fromisoformat(meta["last_modified"])
+        except ValueError:
+            mt = None
+    if mt is not None:
+        if mt > now + dt.timedelta(minutes=5):
+            add("timeline", "high", 25, "Last-modified time is in the future",
+                f"File claims to be modified {mt:%Y-%m-%d %H:%M} UTC, later than the moment it was ingested.")
+        if mt.year < 1995:
+            add("timeline", "medium", 15, "Timestamp reset to the 1970s/1980s",
+                f"Last-modified = {mt:%Y-%m-%d}; typical of stripped or forged timestamps.")
+        m = FILENAME_DATE.search(name)
+        if m:
+            fd = dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            if mt.date() < fd - dt.timedelta(days=2):
+                add("timeline", "high", 25, "File modified before the date in its own name",
+                    f"Name says {fd}, but last-modified is {mt:%Y-%m-%d} — impossible order of events.")
+        eo = parse_exif_dt(meta.get("exif", {}).get("DateTimeOriginal"))
+        if eo and mt.replace(tzinfo=None) < eo - dt.timedelta(days=1):
+            add("timeline", "high", 35, "File saved before the photo was supposedly taken",
+                f"EXIF capture time {eo:%Y-%m-%d %H:%M} is later than file last-modified {mt:%Y-%m-%d %H:%M}.")
+
+    # --- metadata
+    ex = meta.get("exif", {})
+    sw = ex.get("Software", "")
+    if sw and EDITORS.search(sw):
+        add("metadata", "high", 20, "Image processed with an editing program", f"EXIF Software = '{sw}'.")
+    eo, ed = parse_exif_dt(ex.get("DateTimeOriginal")), parse_exif_dt(ex.get("DateTime"))
+    if eo and ed and abs(ed - eo) > dt.timedelta(days=1):
+        add("metadata", "medium", 15, "EXIF modified-date differs from capture date",
+            f"Captured {eo:%Y-%m-%d}, metadata last changed {ed:%Y-%m-%d} ({abs((ed - eo).days)} days apart).")
+    if det == "jpeg" and not ex:
+        add("metadata", "low", 5, "JPEG has no EXIF metadata", "Camera metadata may have been stripped.")
+    return F
+
+
+# ------------------------------------------------------------------ ingest
+def ingest(case_id, rel_path, data: bytes, mtime_ms, actor, mime="") -> dict:
+    rel = clean_rel(rel_path)
+    filename = rel.rsplit("/", 1)[-1]
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    sha = sha256_hex(data)
+    img, exif = read_exif(data)
+    last_mod = None
+    if mtime_ms is not None:
+        try:
+            last_mod = (dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc) +
+                        dt.timedelta(milliseconds=float(mtime_ms))).isoformat()
+        except (OverflowError, ValueError):
+            last_mod = None
+    meta = {"filename": filename, "relative_path": rel, "size_bytes": len(data), "extension": ext,
+            "detected_type": detect_type(data), "browser_mime": mime or "", "last_modified": last_mod,
+            "entropy": shannon_entropy(data[:1_000_000]), "image": img, "exif": exif}
+    findings = static_findings(meta, dt.datetime.now(dt.timezone.utc))
+    with db() as c:
+        eid = c.execute(
+            "INSERT INTO evidence(case_id,rel_path,filename,size_bytes,sha256,meta,static_findings,"
+            "uploaded_by,uploaded_at,custodian) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (case_id, rel, filename, len(data), sha, canon(meta), canon(findings), actor, now_iso(), actor)
+        ).lastrowid
+    blob_path(eid).write_bytes(data)
+    score = min(100, sum(f["points"] for f in findings))
+    audit(actor, "UPLOAD", eid, {"sha256": sha, "size": len(data), "path": rel, "case": case_id})
+    return {"id": eid, "filename": rel, "sha256": sha, "score": score, "level": level(score)}
+
+
+# ------------------------------------------------------------------ queries
+def get_evidence(eid: int):
+    with db() as c:
+        r = c.execute("SELECT * FROM evidence WHERE id=?", (eid,)).fetchone()
+        return dict(r) if r else None
+
+
+def context():
+    with db() as c:
+        ev = [dict(r) for r in c.execute("SELECT * FROM evidence ORDER BY id")]
+        rows = load_audit(c)
+    dup_map, by_ev = {}, {}
+    for e in ev:
+        dup_map.setdefault(e["sha256"], []).append(e["id"])
+    for a in rows:
+        if a["evidence_id"]:
+            by_ev.setdefault(a["evidence_id"], []).append(a)
+    return ev, rows, dup_map, by_ev
+
+
+def local_hour(ts: str) -> int:
+    return parse_ts(ts).astimezone().hour
+
+
+def after_hours(ts: str) -> bool:
+    h = local_hour(ts)
+    return h < OFFICE_START or h >= OFFICE_END
+
+
+def evaluate(e: dict, dup_map: dict, by_ev: dict) -> dict:
+    """Explainable risk: every point of the score comes from a named finding."""
+    F = json.loads(e["static_findings"] or "[]")
+
+    def add(cat, sev, pts, title, detail):
+        F.append({"category": cat, "severity": sev, "points": pts, "title": title, "detail": detail})
+
+    if e["status"] == "TAMPERED":
+        add("integrity", "critical", 100, "SHA-256 mismatch — file changed after ingest",
+            f"Recorded {e['sha256'][:20]}… but last check computed {(e.get('last_hash') or 'FILE MISSING')[:20]}…")
+    dups = [i for i in dup_map.get(e["sha256"], []) if i != e["id"]]
+    if dups:
+        add("duplicate", "medium", 20, "Duplicate content",
+            "Identical SHA-256 to " + ", ".join(f"EV-{i:04d}" for i in dups[:5]))
+    events = by_ev.get(e["id"], [])
+    custody = {e["uploaded_by"]}
+    for a in events:
+        if a["action"] == "TRANSFER":
+            custody |= {a["detail"].get("from"), a["detail"].get("to")}
+    acc = [a for a in events if a["action"] in ACCESS_ACTIONS]
+    outsiders = sorted({a["actor"] for a in acc if a["actor"] not in custody})
+    if outsiders:
+        add("access", "high", 25, "Accessed by someone outside the custody chain", ", ".join(outsiders))
+    night = [a for a in acc if after_hours(a["ts"])]
+    if night:
+        add("access", "medium", 10, f"{len(night)} access event(s) outside office hours",
+            f"Allowed window is {OFFICE_START:02d}:00–{OFFICE_END:02d}:00 local time.")
+    if len([a for a in acc if a["action"] == "DOWNLOAD_EVIDENCE"]) >= 3:
+        add("access", "low", 10, "Repeated downloads", "Three or more downloads of the same item.")
+    score = min(100, sum(f["points"] for f in F))
+    failed = {f["category"] for f in F if f["points"] > 0}
+    checks = [{"key": k, "label": lbl, "status": "fail" if k in failed else "pass"} for k, lbl in CATEGORIES]
+    return {"score": score, "level": level(score), "findings": F, "checks": checks}
+
+
+def attach_risk(e: dict, dup_map, by_ev) -> dict:
+    e["m"] = json.loads(e["meta"])
+    e["risk"] = evaluate(e, dup_map, by_ev)
+    return e
+
+
+def access_anomalies(rows: list) -> list:
+    """System-wide unusual access patterns (not tied to a single file)."""
+    out = []
+    fails = sorted((parse_ts(r["ts"]), r["ts"]) for r in rows if r["action"] == "LOGIN_FAILED")
+    for i in range(len(fails)):
+        j = i
+        while j < len(fails) and (fails[j][0] - fails[i][0]).total_seconds() <= 600:
+            j += 1
+        if j - i >= 3:
+            out.append({"severity": "high", "title": "Repeated failed fingerprint attempts",
+                        "detail": f"{j - i} failed attempts within 10 minutes", "ts": fails[i][1]})
+            break
+    by_actor = {}
+    for r in rows:
+        if r["action"] in ACCESS_ACTIONS and r["evidence_id"]:
+            by_actor.setdefault(r["actor"], []).append((parse_ts(r["ts"]), r["evidence_id"], r["ts"]))
+    for actor, evs in by_actor.items():
+        evs.sort()
+        for i in range(len(evs)):
+            ids, j = set(), i
+            while j < len(evs) and (evs[j][0] - evs[i][0]).total_seconds() <= 120:
+                ids.add(evs[j][1])
+                j += 1
+            if len(ids) >= 8:
+                out.append({"severity": "high", "title": "Bulk access burst",
+                            "detail": f"{actor} opened {len(ids)} different items within 2 minutes", "ts": evs[i][2]})
+                break
+    night = [r for r in rows if r["action"] in ACCESS_ACTIONS + ("LOGIN_FINGERPRINT_SUCCESS",) and after_hours(r["ts"])]
+    if night:
+        out.append({"severity": "medium", "title": f"{len(night)} after-hours access/login event(s)",
+                    "detail": f"Latest by {night[-1]['actor']} (allowed {OFFICE_START:02d}:00–{OFFICE_END:02d}:00)",
+                    "ts": night[-1]["ts"]})
+    return out
+
+
+# ------------------------------------------------------------------ integrity actions
+def mark_tampered(eid: int, current_hash):
+    with db() as c:
+        c.execute("UPDATE evidence SET status='TAMPERED', last_hash=?, last_verified_at=? WHERE id=?",
+                  (current_hash or "FILE MISSING", now_iso(), eid))
+
+
+def verify_integrity(eid: int, actor: str, log=True) -> dict:
+    row = get_evidence(eid)
+    p = blob_path(eid)
+    current = sha256_file(p) if p.exists() else None
+    ok = current == row["sha256"]
+    with db() as c:
+        c.execute("UPDATE evidence SET status=?, last_verified_at=?, last_hash=? WHERE id=?",
+                  ("INTACT" if ok else "TAMPERED", now_iso(), current or "FILE MISSING", eid))
+    if log:
+        audit(actor, "VERIFY_INTEGRITY", eid,
+              {"result": "MATCH" if ok else "MISMATCH", "expected": row["sha256"], "computed": current})
+    return {"ok": ok, "expected": row["sha256"], "computed": current}
+
+
+def transfer(eid: int, actor: str, to_user: str, reason: str):
+    row = get_evidence(eid)
+    with db() as c:
+        c.execute("UPDATE evidence SET custodian=? WHERE id=?", (to_user, eid))
+    audit(actor, "TRANSFER", eid, {"from": row["custodian"], "to": to_user, "reason": reason[:200]})
+
+
+# ------------------------------------------------------------------ signed report
+def signing_key():
+    DATA.mkdir(parents=True, exist_ok=True)
+    if KEY_PATH.exists():
+        return serialization.load_pem_private_key(KEY_PATH.read_bytes(), password=None)
+    k = ed25519.Ed25519PrivateKey.generate()
+    KEY_PATH.write_bytes(k.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                         serialization.NoEncryption()))
+    return k
+
+
+def _pub_raw(k) -> bytes:
+    return k.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+
+
+def key_fingerprint() -> str:
+    h = sha256_hex(_pub_raw(signing_key()))[:16].upper()
+    return "-".join(h[i:i + 4] for i in range(0, 16, 4))
+
+
+def build_report(case_id, actor: str) -> dict:
+    ev, rows, dup_map, by_ev = context()
+    items = []
+    for e in ev:
+        if case_id and e["case_id"] != case_id:
+            continue
+        e = attach_risk(e, dup_map, by_ev)
+        items.append({
+            "id": f"EV-{e['id']:04d}", "evidence_id": e["id"], "case_id": e["case_id"],
+            "filename": e["filename"], "relative_path": e["rel_path"], "size_bytes": e["size_bytes"],
+            "sha256": e["sha256"], "metadata": e["m"], "uploaded_by": e["uploaded_by"],
+            "uploaded_at": e["uploaded_at"], "current_custodian": e["custodian"],
+            "integrity_status": e["status"], "last_verified_at": e["last_verified_at"],
+            "risk": {"score": e["risk"]["score"], "level": e["risk"]["level"], "findings": e["risk"]["findings"]},
+            "custody_events": [{"audit_id": a["id"], "ts": a["ts"], "actor": a["actor"], "action": a["action"],
+                                "detail": a["detail"], "entry_hash": a["entry_hash"]} for a in by_ev.get(e["id"], [])],
+        })
+    report = {
+        "report_version": 1, "tool": "Evidence Vault - AVISHKAR'26 prototype (team IGRIS)",
+        "hash_algorithm": "SHA-256", "generated_at": now_iso(), "generated_by": actor,
+        "case_id": case_id or "ALL", "audit_chain": verify_chain(), "evidence": items,
+        "audit_log": [{k: r[k] for k in ("id", "ts", "actor", "action", "evidence_id", "detail",
+                                         "prev_hash", "entry_hash")} for r in rows],
+    }
+    body = canon(report).encode()
+    key = signing_key()
+    return {"report": report, "report_sha256": sha256_hex(body), "signature_alg": "Ed25519",
+            "signature": base64.b64encode(key.sign(body)).decode(),
+            "public_key": base64.b64encode(_pub_raw(key)).decode(), "public_key_fingerprint": key_fingerprint()}
+# ------------------------------------------------------------------ verify a document against the vault
+def find_blocks(eid: int):
+    """Audit blocks around the UPLOAD block of one evidence item (1 before, 2 after)."""
+    rows = load_audit()
+    idx = next((i for i, r in enumerate(rows)
+                if r["action"] == "UPLOAD" and r["evidence_id"] == eid), None)
+    if idx is None:
+        return [], None
+    target = rows[idx]["id"]
+    out = []
+    for r in rows[max(0, idx - 1): idx + 3]:
+        out.append({"id": r["id"], "action": ACTION_LABELS.get(r["action"], r["action"]),
+                    "actor": r["actor"], "ts": r["ts"],
+                    "prev_hash": r["prev_hash"][:12], "entry_hash": r["entry_hash"][:12],
+                    "is_target": r["id"] == target})
+    return out, target
+
+
+def verify_document(filename: str, data: bytes, actor: str) -> dict:
+    sha = sha256_hex(data)
+    with db() as c:
+        same = c.execute("SELECT * FROM evidence WHERE sha256=? ORDER BY id LIMIT 1", (sha,)).fetchone()
+        named = c.execute("SELECT * FROM evidence WHERE filename=? ORDER BY id LIMIT 1", (filename,)).fetchone()
+    if same:
+        row, status = dict(same), "VERIFIED"
+    elif named:
+        row, status = dict(named), "TAMPERED"
+    else:
+        audit(actor, "VERIFY_EXTERNAL_COPY", None, {"result": "NOT_FOUND", "file": filename, "copy_sha256": sha})
+        return {"status": "NOT_FOUND", "computed": sha, "filename": filename}
+    blocks, target = find_blocks(row["id"])
+    audit(actor, "VERIFY_EXTERNAL_COPY", row["id"],
+          {"result": "MATCH" if status == "VERIFIED" else "MISMATCH",
+           "copy_sha256": sha, "recorded_sha256": row["sha256"]})
+    return {"status": status, "evidence": f"EV-{row['id']:04d}", "path": row["rel_path"],
+            "expected": row["sha256"], "computed": sha, "filename": filename,
+            "blocks": blocks, "tampered_block": target if status == "TAMPERED" else None}

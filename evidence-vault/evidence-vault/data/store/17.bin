@@ -1,0 +1,4 @@
+{% macro t(ts) -%}<time data-ts="{{ ts }}">{{ ts[:19]|replace('T',' ') }} UTC</time>{%- endmacro %}
+{% macro badge(level, score=None) -%}<span class="badge {{ level|lower }}">{{ level }}{% if score is not none %} · {{ score }}{% endif %}</span>{%- endmacro %}
+{% macro status(s) -%}<span class="badge {{ 'ok' if s == 'INTACT' else 'critical' }}">{{ '✔ ' if s == 'INTACT' else '✖ ' }}{{ s }}</span>{%- endmacro %}
+{% macro fp_icon() -%}<svg viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M32 8c-13 0-22 9-22 21v6"/><path d="M32 16c-8 0-14 6-14 14v8c0 4-1 8-3 11"/><path d="M32 24c-4 0-6 3-6 7v6c0 6-2 11-5 15"/><path d="M32 32v7c0 8-2 14-6 19"/><path d="M40 28c0-5-3-8-8-8"/><path d="M40 36v4c0 8-2 14-5 20"/><path d="M48 24c-2-9-8-14-16-14"/><path d="M48 34v6c0 7-1 12-3 17"/></svg>{%- endmacro %}

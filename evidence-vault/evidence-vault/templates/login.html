@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% import "_m.html" as m %}
+{% block title %}Sign in · Evidence Vault{% endblock %}
+{% block bodyclass %}auth{% endblock %}
+{% block content %}
+<section class="login-card">
+  <div class="brand-big">🔐 Evidence <span>Vault</span></div>
+  <p class="muted">Digital evidence verification &amp; chain-of-custody</p>
+
+  <div id="warn-ip" class="alert warn" hidden>Open this app at <b>http://localhost:5000</b> – fingerprint login does not work on an IP address.</div>
+  <div id="warn-nosupport" class="alert warn" hidden>This browser has no fingerprint (WebAuthn) support. Use Chrome or Edge.</div>
+
+  {% if has_users %}
+    <button id="btn-login" class="fp-btn" data-next="{{ next }}">{{ m.fp_icon() }}<span>Scan fingerprint to sign in</span></button>
+  {% else %}
+    <p class="small muted">First-time setup – enroll the lead investigator. Your laptop's fingerprint reader (Windows Hello) will open.</p>
+    <label for="enroll-name" style="text-align:left">Investigator name</label>
+    <input id="enroll-name" type="text" placeholder="e.g. Adithya Tejas B" maxlength="60" autocomplete="off">
+    <button id="btn-enroll-first" class="fp-btn">{{ m.fp_icon() }}<span>Enroll my fingerprint</span></button>
+  {% endif %}
+  <p id="login-status" class="status"></p>
+
+  <ul class="notes">
+    <li>Evidence can only be opened after a fingerprint scan.</li>
+    <li>Every login, scan, view, download and transfer is written to a hash-chained audit log.</li>
+    <li>Your fingerprint never leaves the laptop – the server only stores a public key.</li>
+  </ul>
+</section>
+{% endblock %}

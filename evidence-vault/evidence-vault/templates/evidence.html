@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% import "_m.html" as m %}
+{% block title %}EV-{{ '%04d'|format(e.id) }} · Evidence Vault{% endblock %}
+{% block bodyattrs %}data-evidence="{{ e.id }}"{% endblock %}
+{% block content %}
+<p><a href="{{ url_for('dashboard') }}">← Dashboard</a></p>
+<div class="card" style="display:flex;gap:24px;align-items:center;flex-wrap:wrap;margin-bottom:16px">
+  <div class="gauge {{ e.risk.level|lower }}" style="--v:{{ e.risk.score }}"><span>{{ e.risk.score }}</span></div>
+  <div style="flex:1;min-width:260px">
+    <div class="muted small">EV-{{ '%04d'|format(e.id) }} · {{ e.case_id }}</div>
+    <h2 style="word-break:break-all">{{ e.rel_path }}</h2>
+    <div>{{ m.badge(e.risk.level, e.risk.score) }} {{ m.status(e.status) }}
+      <span class="muted small">· custodian <b>{{ e.custodian }}</b> · ingested by {{ e.uploaded_by }}</span></div>
+  </div>
+  <div class="row-actions">
+    <button class="btn primary" data-act="verify">Verify integrity</button>
+    <a class="btn" href="{{ url_for('download', eid=e.id) }}">Download</a>
+  </div>
+</div>
+<div id="action-result" class="alert" hidden></div>
+
+<div class="grid cols2">
+  <div class="grid">
+    <section class="card">
+      <h3>Why this risk score?</h3>
+      {% set bad = e.risk.findings|selectattr('points')|list %}
+      {% for f in bad %}
+        <div class="finding"><div class="pts {{ f.severity }}">+{{ f.points }}</div>
+          <div><b>{{ f.title }}</b><div class="small muted">{{ f.detail }}</div></div></div>
+      {% else %}<p class="muted">No anomalies found – every check passed (score 0).</p>{% endfor %}
+      <h3 style="margin-top:16px">Checks performed</h3>
+      <div class="checks">
+        {% for c in e.risk.checks %}<div class="check {{ c.status }}"><b>{{ '✔' if c.status == 'pass' else '✖' }}</b> {{ c.label }}</div>{% endfor %}
+      </div>
+    </section>
+
+    <section class="card">
+      <h3>Custody timeline <span class="muted small">hash-chained audit entries</span></h3>
+      <ul class="timeline">
+      {% for a in events|reverse %}
+        <li><span class="act">{{ a.action|label }}</span> · {{ a.actor }} · <span class="muted">{{ m.t(a.ts) }}</span>
+          <div class="det">{{ a.detail|detail }}</div>
+          <div class="det mono">#{{ a.id }} · hash {{ a.entry_hash[:20] }}… ← prev {{ a.prev_hash[:10] }}…</div></li>
+      {% endfor %}
+      </ul>
+    </section>
+  </div>
+
+  <div class="grid">
+    <section class="card">
+      <h3>Fingerprint of the file</h3>
+      <div class="hash"><span class="mono" style="flex:1">{{ e.sha256 }}</span><button class="btn sm" data-copy="{{ e.sha256 }}">Copy</button></div>
+      <p class="small muted">SHA-256 recorded at ingest. Last check: {% if e.last_verified_at %}{{ m.t(e.last_verified_at) }}{% else %}at ingest only{% endif %}.</p>
+      {% if dups %}<div class="alert warn small">Identical content also stored as {% for i in dups %}<a href="{{ url_for('evidence_detail', eid=i) }}">EV-{{ '%04d'|format(i) }}</a>{{ ', ' if not loop.last }}{% endfor %}.</div>{% endif %}
+      <label>Compare an outside copy of this file against the record</label>
+      <input type="file" id="copy-file">
+    </section>
+
+    <section class="card">
+      <h3>Captured metadata</h3>
+      <dl class="kv">
+        <dt>Size</dt><dd>{{ e.m.size_bytes|filesize }} ({{ e.m.size_bytes }} bytes)</dd>
+        <dt>Extension</dt><dd>.{{ e.m.extension }}</dd>
+        <dt>Detected type</dt><dd>{{ e.m.detected_type }}</dd>
+        <dt>Browser MIME</dt><dd>{{ e.m.browser_mime or '—' }}</dd>
+        <dt>Last modified</dt><dd>{% if e.m.last_modified %}{{ m.t(e.m.last_modified) }}{% else %}unknown{% endif %}</dd>
+        <dt>Ingested</dt><dd>{{ m.t(e.uploaded_at) }}</dd>
+        <dt>Entropy</dt><dd>{{ e.m.entropy }} / 8</dd>
+        {% for k, v in (e.m.image or {}).items() %}<dt>Image {{ k }}</dt><dd>{{ v }}</dd>{% endfor %}
+        {% for k, v in (e.m.exif or {}).items() %}<dt>EXIF {{ k }}</dt><dd>{{ v }}</dd>{% endfor %}
+      </dl>
+    </section>
+
+    <section class="card">
+      <h3>Transfer custody</h3>
+      {% if others %}
+      <form id="transfer-form">
+        <label>New custodian</label>
+        <select name="to">{% for u in others %}<option>{{ u.username }}</option>{% endfor %}</select>
+        <label>Reason</label><input name="reason" type="text" placeholder="e.g. handed to forensic lab" maxlength="200">
+        <p><button class="btn" type="submit">Record transfer</button></p>
+      </form>
+      {% else %}<p class="muted small">Enroll a second investigator on the dashboard to demonstrate a custody hand-over.</p>{% endif %}
+    </section>
+
+    {% if demo_mode %}
+    <section class="card">
+      <h3>Demo tools</h3>
+      <p class="small muted">For the live demo only (synthetic data): alter the stored copy, then run “Verify integrity”.</p>
+      <button class="btn danger sm" data-act="tamper">Simulate tampering</button>
+    </section>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

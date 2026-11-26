@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% block title %}Evidence Vault{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="{% block bodyclass %}{% endblock %}" {% block bodyattrs %}{% endblock %}>
+{% if user %}
+<header class="topbar">
+  <a class="brand" href="{{ url_for('dashboard') }}">🔐 Evidence <span>Vault</span></a>
+  <nav>
+    <a href="{{ url_for('dashboard') }}" class="{{ 'on' if request.endpoint == 'dashboard' }}">Dashboard</a>
+    <a href="{{ url_for('audit_page') }}" class="{{ 'on' if request.endpoint == 'audit_page' }}">Audit log</a>
+    <a href="{{ url_for('report') }}">Export report (JSON)</a>
+  </nav>
+  <div class="chip-user"><span><i class="dot"></i>Signed in by fingerprint: <b>{{ user }}</b> ({{ role }})</span>
+    <a class="btn sm" href="{{ url_for('logout') }}">Logout</a></div>
+</header>
+{% endif %}
+<main class="wrap">{% block content %}{% endblock %}
+  {% if user %}<footer class="fp">Team IGRIS · AVISHKAR'26 · Reports are signed with key {{ key_fp }}</footer>{% endif %}
+</main>
+<div id="toasts"></div>
+<script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</body>
+</html>
